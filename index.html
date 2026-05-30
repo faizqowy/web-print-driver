@@ -22,39 +22,60 @@
           </div>
         </div>
 
-        <div class="status-badge">
-          <span class="status-lbl">Port 9000</span>
-          <span class="status-val">RUNNING</span>
+        <div style="display: flex; gap: 8px; align-items: center;">
+          <!-- Missing Default Printer Warning -->
+          <div id="warning-banner" class="status-badge" style="display: none; background-color: rgba(239, 68, 68, 0.1); border-color: #ef4444; font-size: 10px; padding: 4px 8px;">
+            <span style="color: #ef4444;">⚠️ Printer Missing / Cleared</span>
+          </div>
+
+          <div class="status-badge">
+            <span class="status-lbl">Port 9000</span>
+            <span class="status-val">RUNNING</span>
+          </div>
         </div>
       </header>
 
       <!-- Grid Content -->
       <section class="grid-layout">
         <!-- Discovered Printers List -->
-        <div class="card card-printers">
-          <div class="card-header">
-            <h3>Discovered Printers</h3>
-            <button id="btn-refresh-printers" class="btn-icon" title="Refresh Printers">
-              <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" class="w-4 h-4">
-                <path stroke-linecap="round" strokeLinejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 1121.21 8H18.2" />
-              </svg>
-            </button>
+        <div class="card card-printers" style="display: flex; flex-direction: column; justify-content: space-between;">
+          <div>
+            <div class="card-header">
+              <h3>Discovered Printers</h3>
+              <button id="btn-refresh-printers" class="btn-icon" title="Refresh Printers">
+                <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" class="w-4 h-4">
+                  <path stroke-linecap="round" strokeLinejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 1121.21 8H18.2" />
+                </svg>
+              </button>
+            </div>
+            <div class="printers-list" id="printers-container" style="max-height: 120px;">
+              <div class="loading-state">Querying system printers...</div>
+            </div>
           </div>
-          <div class="printers-list" id="printers-container">
-            <div class="loading-state">Querying system printers...</div>
-          </div>
+          <button id="btn-set-default" class="btn btn-secondary" style="margin-top: 8px; width: 100%; display: none;">
+            Set As Default Printer
+          </button>
         </div>
 
-        <!-- System Controls -->
+        <!-- System Controls & Settings -->
         <div class="card card-controls">
           <div class="card-header">
-            <h3>Diagnostics & Control</h3>
+            <h3>Diagnostics & Settings</h3>
           </div>
-          <div class="controls-actions">
+          <div class="controls-actions" style="gap: 12px;">
             <div class="info-row">
               <span>Local Service:</span>
               <span class="text-emerald-400 font-bold font-mono">http://localhost:9000</span>
             </div>
+
+            <!-- Persistent Settings Section -->
+            <div class="info-row" style="display: flex; align-items: center; justify-content: space-between;">
+              <span>Default Printer:</span>
+              <select id="select-default-printer" style="background-color: var(--bg-input); color: var(--text-main); border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px; font-size: 11px; width: 160px; outline: none; cursor: pointer;">
+                <option value="">-- No Default --</option>
+              </select>
+            </div>
+
             <div class="info-row">
               <span>Active Engines:</span>
               <span class="text-violet-400 font-bold">Thermal, Word, WordPad</span>
@@ -62,7 +83,7 @@
             
             <div class="btn-group">
               <button id="btn-clear-logs" class="btn btn-secondary">
-                Clear Print History
+                Clear Logs
               </button>
               <button id="btn-test-print" class="btn btn-primary">
                 Trigger Test Slip

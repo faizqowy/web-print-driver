@@ -9,8 +9,14 @@ interface PrintLog {
   details: string;
 }
 
+interface DriverSettings {
+  defaultPrinter: string | null;
+  autoReconnect: boolean;
+}
+
 // State cache
 let selectedPrinterName = "";
+let defaultPrinterName = "";
 
 window.addEventListener("DOMContentLoaded", () => {
   // Elements
@@ -22,7 +28,57 @@ window.addEventListener("DOMContentLoaded", () => {
   const btnClearLogs = document.getElementById("btn-clear-logs");
   const btnTestPrint = document.getElementById("btn-test-print");
 
-  // 1. Fetch Discovered System Printers
+  // Settings Elements
+  const selectDefaultPrinter = document.getElementById("select-default-printer") as HTMLSelectElement | null;
+  const btnSetDefault = document.getElementById("btn-set-default");
+  const warningBanner = document.getElementById("warning-banner");
+
+  // 1. Fetch persistent Driver Settings from API
+  const refreshSettings = async () => {
+    try {
+      const response = await fetch("http://localhost:9000/settings");
+      if (response.ok) {
+        const data: DriverSettings = await response.json();
+        defaultPrinterName = data.defaultPrinter || "";
+        
+        if (selectDefaultPrinter) {
+          selectDefaultPrinter.value = defaultPrinterName;
+        }
+
+        // Re-render the active chips to reflect default highlight
+        updatePrintersHighlight();
+      }
+    } catch (err) {
+      console.error("Failed to query settings API:", err);
+    }
+  };
+
+  // Sync settings and update the default highlights on printer chips
+  const updatePrintersHighlight = () => {
+    document.querySelectorAll(".printer-chip").forEach((chipElement) => {
+      const chip = chipElement as HTMLElement;
+      const name = chip.getAttribute("data-printer-name") || "";
+      
+      // Reset styles first
+      chip.style.borderColor = "#1e293b";
+      chip.style.backgroundColor = "#080c14";
+      const cleanName = name;
+      chip.textContent = cleanName;
+
+      // If it is the default printer, color it green
+      if (name === defaultPrinterName) {
+        chip.style.borderColor = "#10b981"; // Emerald green
+        chip.style.backgroundColor = "rgba(16, 185, 129, 0.05)";
+        chip.textContent = `${cleanName} (Default)`;
+      } 
+      // If it is selected for manual diagnostics, color it violet
+      else if (name === selectedPrinterName) {
+        chip.style.borderColor = "#a78bfa"; // Violet purple
+      }
+    });
+  };
+
+  // 2. Fetch Discovered System Printers
   const refreshPrinters = async () => {
     if (!printersContainer) return;
     printersContainer.innerHTML = '<div class="loading-state">Querying devices...</div>';
@@ -33,30 +89,55 @@ window.addEventListener("DOMContentLoaded", () => {
         const data = await response.json();
         const printers: string[] = data.printers || [];
         
+        // 1. Populating Dropdown select list
+        if (selectDefaultPrinter) {
+          // Preserve current selection or default
+          const currentSelectVal = selectDefaultPrinter.value;
+          selectDefaultPrinter.innerHTML = '<option value="">-- No Default --</option>';
+          
+          printers.forEach((name) => {
+            const opt = document.createElement("option");
+            opt.value = name;
+            opt.textContent = name;
+            selectDefaultPrinter.appendChild(opt);
+          });
+          selectDefaultPrinter.value = currentSelectVal || defaultPrinterName;
+        }
+
+        // 2. Rendering Printer Chips
         if (printers.length > 0) {
           printersContainer.innerHTML = "";
           printers.forEach((name) => {
             const chip = document.createElement("div");
             chip.className = "printer-chip";
             chip.textContent = name;
-            chip.title = "Click to set as test target";
+            chip.setAttribute("data-printer-name", name);
+            chip.title = "Click to select as test target";
             
             // Allow selecting a printer for test prints
             chip.addEventListener("click", () => {
-              document.querySelectorAll(".printer-chip").forEach(el => el.classList.remove("border-violet-500"));
-              chip.style.borderColor = "#a78bfa";
               selectedPrinterName = name;
+              updatePrintersHighlight();
+
+              // Show the "Set As Default Printer" button
+              if (btnSetDefault) {
+                btnSetDefault.style.display = "block";
+              }
             });
             
             printersContainer.appendChild(chip);
           });
           
-          // Preselect first printer
-          selectedPrinterName = printers[0];
-          const firstChip = printersContainer.firstElementChild as HTMLElement;
-          if (firstChip) firstChip.style.borderColor = "#a78bfa";
+          // Preselect first printer for test spools if none is selected
+          if (!selectedPrinterName) {
+            selectedPrinterName = printers[0];
+          }
+
+          // Trigger highlight update
+          await refreshSettings();
         } else {
           printersContainer.innerHTML = '<div class="loading-state text-amber-500">No active printers discovered.</div>';
+          if (btnSetDefault) btnSetDefault.style.display = "none";
         }
       } else {
         printersContainer.innerHTML = '<div class="loading-state text-red-500">HTTP Error loading printers list.</div>';
@@ -66,13 +147,25 @@ window.addEventListener("DOMContentLoaded", () => {
     }
   };
 
-  // 2. Fetch Real-time Print Logs from Rust AppState
+  // 3. Fetch Real-time Print Logs from Rust AppState
   const updatePrintLogs = async () => {
     if (!logsTbody || !logCountSpan) return;
 
     try {
       const logs = await invoke<PrintLog[]>("get_print_logs");
       logCountSpan.textContent = `${logs.length} Job${logs.length === 1 ? "" : "s"} Spooled`;
+
+      // Scan logs for any startup validator warnings
+      let hasWarning = false;
+      logs.forEach((log) => {
+        if (log.status === "Warning" || log.print_engine === "Startup Validator") {
+          hasWarning = true;
+        }
+      });
+
+      if (warningBanner) {
+        warningBanner.style.display = hasWarning ? "block" : "none";
+      }
 
       if (logs.length > 0) {
         // Reverse logs to show most recent at the top
@@ -82,18 +175,30 @@ window.addEventListener("DOMContentLoaded", () => {
         reversed.forEach((log) => {
           const row = document.createElement("tr");
           
-          const isSuccess = log.status.toLowerCase() === "success";
-          const badgeClass = isSuccess ? "status-success" : "status-failed";
+          const statusLower = log.status.toLowerCase();
+          const isSuccess = statusLower === "success";
+          const isWarning = statusLower === "warning";
+          
+          const badgeClass = isSuccess 
+            ? "status-success" 
+            : isWarning 
+            ? "status-success" // Warning styles in html
+            : "status-failed";
+
+          // Use custom styling for warning logs
+          const statusStyle = isWarning 
+            ? 'background-color: rgba(239, 68, 68, 0.1); border-color: rgba(239, 68, 68, 0.15); color: #ef4444;' 
+            : '';
           
           row.innerHTML = `
             <td class="col-time font-mono">${log.timestamp}</td>
-            <td class="col-type font-bold">${log.document_type}</td>
+            <td class="col-type font-bold" style="${isWarning ? 'color: #ef4444;' : ''}">${log.document_type}</td>
             <td class="col-printer truncate" title="${log.printer_name}">${log.printer_name}</td>
             <td class="col-engine text-violet-400 font-bold">${log.print_engine}</td>
             <td class="col-status">
-              <span class="status-badge-log ${badgeClass}">${log.status}</span>
+              <span class="status-badge-log ${badgeClass}" style="${statusStyle}">${log.status}</span>
             </td>
-            <td class="col-details truncate text-slate-400" title="${log.details}">${log.details}</td>
+            <td class="col-details truncate text-slate-400" title="${log.details}" style="${isWarning ? 'color: #f87171;' : ''}">${log.details}</td>
           `;
           
           logsTbody.appendChild(row);
@@ -110,16 +215,16 @@ window.addEventListener("DOMContentLoaded", () => {
     }
   };
 
-  // 3. Trigger Test Slip (Send simple ESC/POS Base64 to printer)
+  // 4. Trigger Test Slip (Send simple ESC/POS Base64 to printer)
   const triggerTestPrint = async () => {
-    if (!selectedPrinterName) {
-      alert("Please select a target printer from the Discovered list first.");
+    // Determine printer target: use selected chip or default printer
+    const targetPrn = selectedPrinterName || defaultPrinterName;
+
+    if (!targetPrn) {
+      alert("Please select a target printer or configure a Default Printer first.");
       return;
     }
 
-    // ESC/POS raw test packet: "QPOS Driver Diagnostic OK\n\n\n\n" followed by paper cut codes
-    // Hello World ESC/POS hex string: 51 50 4F 53 20 44 72 69 76 65 72 20 54 65 73 74 20 53 75 63 63 65 73 73 21 0A 0A 0A 0A 1D 56 00
-    // base64: UVBPUyBEcml2ZXIgVGVzdCBTdWNjZXNzIQoKCgofVgA=
     const testPayloadBase64 = "UVBPUyBEcml2ZXIgVGVzdCBTdWNjZXNzIQoKCgofVgA=";
 
     try {
@@ -129,7 +234,7 @@ window.addEventListener("DOMContentLoaded", () => {
           "Content-Type": "application/json"
         },
         body: JSON.stringify({
-          printerName: selectedPrinterName,
+          printerName: targetPrn,
           fileContentBase64: testPayloadBase64,
           fileExtension: ".bin"
         })
@@ -137,8 +242,7 @@ window.addEventListener("DOMContentLoaded", () => {
 
       const result = await response.json();
       if (response.ok && result.success) {
-        // Log update will happen on the next interval
-        alert(`Test slip spooled silently to '${selectedPrinterName}'!`);
+        alert(`Test slip spooled silently to '${targetPrn}'!`);
       } else {
         alert(`Test print failed: ${result.error || "unknown spooler error"}`);
       }
@@ -147,7 +251,32 @@ window.addEventListener("DOMContentLoaded", () => {
     }
   };
 
-  // 4. Clear print history logs
+  // 5. Update Default Printer API Request
+  const saveDefaultPrinter = async (printerName: string) => {
+    try {
+      const response = await fetch("http://localhost:9000/settings/default-printer", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          printerName: printerName
+        })
+      });
+
+      const result = await response.json();
+      if (response.ok && result.success) {
+        await refreshSettings();
+        await updatePrintLogs();
+      } else {
+        alert(`Failed to save default printer: ${result.error || "unknown error"}`);
+      }
+    } catch (err: any) {
+      alert(`Settings save failed: ${err.message}`);
+    }
+  };
+
+  // 6. Clear print history logs
   const clearLogs = async () => {
     if (confirm("Are you sure you want to clear the local session log history?")) {
       try {
@@ -163,6 +292,17 @@ window.addEventListener("DOMContentLoaded", () => {
   btnRefreshPrinters?.addEventListener("click", refreshPrinters);
   btnClearLogs?.addEventListener("click", clearLogs);
   btnTestPrint?.addEventListener("click", triggerTestPrint);
+
+  // Bind Default settings listeners
+  selectDefaultPrinter?.addEventListener("change", () => {
+    saveDefaultPrinter(selectDefaultPrinter.value);
+  });
+
+  btnSetDefault?.addEventListener("click", () => {
+    if (selectedPrinterName) {
+      saveDefaultPrinter(selectedPrinterName);
+    }
+  });
 
   // Initialize
   refreshPrinters();

@@ -11,6 +11,20 @@ use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{TrayIcon, TrayIconBuilder, TrayIconEvent, MouseButton};
 use base64::Engine;
 
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+
+// Flag constant for hiding terminal popups on Windows
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+// Helper to configure command silent execution
+fn configure_silent_command(cmd: &mut Command) {
+    #[cfg(target_os = "windows")]
+    {
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+}
+
 // Structural print job logs kept in-memory
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct PrintLog {
@@ -22,8 +36,53 @@ pub struct PrintLog {
     details: String,
 }
 
+// Driver configuration structure for local persistence
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct DriverSettings {
+    pub default_printer: Option<String>,
+    pub auto_reconnect: bool,
+}
+
+impl Default for DriverSettings {
+    fn default() -> Self {
+        DriverSettings {
+            default_printer: None,
+            auto_reconnect: true,
+        }
+    }
+}
+
 pub struct AppState {
     logs: Mutex<Vec<PrintLog>>,
+    settings: Mutex<DriverSettings>,
+    settings_path: std::path::PathBuf,
+}
+
+// Helper to load settings from file
+fn load_settings(path: &std::path::Path) -> DriverSettings {
+    if !path.exists() {
+        let defaults = DriverSettings::default();
+        let _ = save_settings_to_file(path, &defaults);
+        return defaults;
+    }
+    match fs::read_to_string(path) {
+        Ok(content) => serde_json::from_str(&content).unwrap_or_else(|_| {
+            let defaults = DriverSettings::default();
+            let _ = save_settings_to_file(path, &defaults);
+            defaults
+        }),
+        Err(_) => DriverSettings::default(),
+    }
+}
+
+// Helper to save settings to file
+fn save_settings_to_file(path: &std::path::Path, settings: &DriverSettings) -> Result<(), String> {
+    let json_str = serde_json::to_string_pretty(settings)
+        .map_err(|err| format!("Failed to serialize settings: {}", err))?;
+    fs::write(path, json_str)
+        .map_err(|err| format!("Failed to write settings file: {}", err))?;
+    Ok(())
 }
 
 // Command exposed to the dashboard webview to fetch print history logs
@@ -44,10 +103,45 @@ fn clear_print_logs(state: tauri::State<'_, AppState>) {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .manage(AppState {
-            logs: Mutex::new(Vec::new()),
-        })
         .setup(|app| {
+            // Setup app settings persistence path in the OS app config directory
+            let config_dir = app.path().app_config_dir().unwrap_or_else(|_| {
+                std::env::current_dir().unwrap_or_default()
+            });
+            let _ = fs::create_dir_all(&config_dir);
+            let settings_path = config_dir.join("settings.json");
+
+            // Load persistent settings
+            let settings = load_settings(&settings_path);
+            let mut verified_settings = settings.clone();
+            let mut warning_log = None;
+
+            // Startup Validation: Check if the default printer still exists on system
+            if let Some(ref default_prn) = settings.default_printer {
+                let installed = get_installed_printers();
+                if !installed.contains(default_prn) {
+                    // Clear the default printer configuration since it no longer exists
+                    verified_settings.default_printer = None;
+                    let _ = save_settings_to_file(&settings_path, &verified_settings);
+
+                    warning_log = Some(PrintLog {
+                        timestamp: get_current_time_str(),
+                        document_type: "System".to_string(),
+                        printer_name: default_prn.clone(),
+                        print_engine: "Startup Validator".to_string(),
+                        status: "Warning".to_string(),
+                        details: format!("Default printer '{}' not found on system. Cleared setting.", default_prn),
+                    });
+                }
+            }
+
+            // Manage persistent AppState
+            app.manage(AppState {
+                logs: Mutex::new(if let Some(log) = warning_log { vec![log] } else { Vec::new() }),
+                settings: Mutex::new(verified_settings),
+                settings_path,
+            });
+
             // 1. Build and Setup System Tray Icon & Context Menu (Tauri v2)
             let show_item = MenuItem::with_id(app, "show", "Open Diagnostics Dashboard", true, None::<&str>)?;
             let quit_item = MenuItem::with_id(app, "quit", "Exit Print Driver", true, None::<&str>)?;
@@ -121,7 +215,7 @@ fn start_native_http_server(app: AppHandle) {
         let url = request.url().to_string();
         let method = request.method().to_string();
 
-        // CORS Preflight headers
+        // CORS Preflight headers - Intercepts OPTIONS for all endpoints
         if method == "OPTIONS" {
             let response = tiny_http::Response::empty(204)
                 .with_header(tiny_http::Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).unwrap())
@@ -145,14 +239,155 @@ fn start_native_http_server(app: AppHandle) {
             continue;
         }
 
+        // GET /settings
+        if url == "/settings" && method == "GET" {
+            if let Some(state) = app.try_state::<AppState>() {
+                let settings = state.settings.lock().unwrap();
+                let json_res = serde_json::to_value(&*settings).unwrap_or(json!({}));
+
+                let response = tiny_http::Response::from_string(json_res.to_string())
+                    .with_status_code(200)
+                    .with_header(tiny_http::Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).unwrap())
+                    .with_header(tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap());
+                let _ = request.respond(response);
+            }
+            continue;
+        }
+
+        // POST /settings
+        if url == "/settings" && method == "POST" {
+            let mut content = String::new();
+            let _ = request.as_reader().read_to_string(&mut content);
+
+            match serde_json::from_str::<DriverSettings>(&content) {
+                Ok(new_settings) => {
+                    if let Some(state) = app.try_state::<AppState>() {
+                        let mut settings = state.settings.lock().unwrap();
+                        let old_printer = settings.default_printer.clone();
+                        let new_printer = new_settings.default_printer.clone();
+
+                        *settings = new_settings.clone();
+                        let _ = save_settings_to_file(&state.settings_path, &*settings);
+
+                        // Log warning/success on change
+                        if old_printer != new_printer {
+                            let log_entry = PrintLog {
+                                timestamp: get_current_time_str(),
+                                document_type: "System".to_string(),
+                                printer_name: new_printer.clone().unwrap_or_else(|| "None".to_string()),
+                                print_engine: "Settings Manager".to_string(),
+                                status: "Success".to_string(),
+                                details: format!(
+                                    "Default printer changed from '{}' to '{}'",
+                                    old_printer.unwrap_or_else(|| "None".to_string()),
+                                    new_printer.unwrap_or_else(|| "None".to_string())
+                                ),
+                            };
+                            state.logs.lock().unwrap().push(log_entry);
+                        }
+
+                        let api_res = json!({ "success": true });
+                        let response = tiny_http::Response::from_string(api_res.to_string())
+                            .with_status_code(200)
+                            .with_header(tiny_http::Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).unwrap())
+                            .with_header(tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap());
+                        let _ = request.respond(response);
+                    }
+                }
+                Err(err) => {
+                    let api_res = json!({ "success": false, "error": "Invalid settings payload", "details": err.to_string() });
+                    let response = tiny_http::Response::from_string(api_res.to_string())
+                        .with_status_code(400)
+                        .with_header(tiny_http::Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).unwrap())
+                        .with_header(tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap());
+                    let _ = request.respond(response);
+                }
+            }
+            continue;
+        }
+
+        // GET /settings/default-printer
+        if url == "/settings/default-printer" && method == "GET" {
+            if let Some(state) = app.try_state::<AppState>() {
+                let settings = state.settings.lock().unwrap();
+                let api_res = json!({ "printerName": settings.default_printer.clone().unwrap_or_default() });
+
+                let response = tiny_http::Response::from_string(api_res.to_string())
+                    .with_status_code(200)
+                    .with_header(tiny_http::Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).unwrap())
+                    .with_header(tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap());
+                let _ = request.respond(response);
+            }
+            continue;
+        }
+
+        // POST /settings/default-printer
+        if url == "/settings/default-printer" && method == "POST" {
+            let mut content = String::new();
+            let _ = request.as_reader().read_to_string(&mut content);
+
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct DefaultPrnPayload {
+                printer_name: String,
+            }
+
+            match serde_json::from_str::<DefaultPrnPayload>(&content) {
+                Ok(payload) => {
+                    if let Some(state) = app.try_state::<AppState>() {
+                        let mut settings = state.settings.lock().unwrap();
+                        let old_printer = settings.default_printer.clone();
+                        let new_printer = if payload.printer_name.is_empty() { None } else { Some(payload.printer_name.clone()) };
+
+                        settings.default_printer = new_printer.clone();
+                        let _ = save_settings_to_file(&state.settings_path, &*settings);
+
+                        // Log change
+                        if old_printer != new_printer {
+                            let log_entry = PrintLog {
+                                timestamp: get_current_time_str(),
+                                document_type: "System".to_string(),
+                                printer_name: new_printer.clone().unwrap_or_else(|| "None".to_string()),
+                                print_engine: "Settings Manager".to_string(),
+                                status: "Success".to_string(),
+                                details: format!(
+                                    "Default printer changed from '{}' to '{}'",
+                                    old_printer.unwrap_or_else(|| "None".to_string()),
+                                    new_printer.unwrap_or_else(|| "None".to_string())
+                                ),
+                            };
+                            state.logs.lock().unwrap().push(log_entry);
+                        }
+
+                        let api_res = json!({ "success": true });
+                        let response = tiny_http::Response::from_string(api_res.to_string())
+                            .with_status_code(200)
+                            .with_header(tiny_http::Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).unwrap())
+                            .with_header(tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap());
+                        let _ = request.respond(response);
+                    }
+                }
+                Err(err) => {
+                    let api_res = json!({ "success": false, "error": "Invalid printerName payload", "details": err.to_string() });
+                    let response = tiny_http::Response::from_string(api_res.to_string())
+                        .with_status_code(400)
+                        .with_header(tiny_http::Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).unwrap())
+                        .with_header(tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap());
+                    let _ = request.respond(response);
+                }
+            }
+            continue;
+        }
+
         // POST /print
         if url == "/print" && method == "POST" {
             let mut content = String::new();
             let _ = request.as_reader().read_to_string(&mut content);
 
             #[derive(Deserialize)]
+            #[allow(non_snake_case)]
             struct PrintPayload {
-                printerName: String,
+                printerName: Option<String>,
                 fileContentBase64: String,
                 fileExtension: Option<String>,
                 printHandler: Option<String>,
@@ -163,8 +398,34 @@ fn start_native_http_server(app: AppHandle) {
                     let file_ext = payload.fileExtension.unwrap_or_else(|| ".bin".to_string());
                     let print_handler = payload.printHandler.unwrap_or_else(|| "word".to_string());
 
+                    // Resolve printer name with backward compatibility support
+                    let mut printer_to_use = payload.printerName.unwrap_or_default();
+                    if printer_to_use.is_empty() {
+                        if let Some(state) = app.try_state::<AppState>() {
+                            let settings = state.settings.lock().unwrap();
+                            if let Some(ref def_prn) = settings.default_printer {
+                                printer_to_use = def_prn.clone();
+                            }
+                        }
+                    }
+
+                    // Return detailed error if no printer target is resolved
+                    if printer_to_use.is_empty() {
+                        let api_res = json!({
+                            "success": false,
+                            "error": "No printer specified and no default printer configured."
+                        });
+                        let json_str = serde_json::to_string(&api_res).unwrap_or_else(|_| "{}".to_string());
+                        let response = tiny_http::Response::from_string(json_str)
+                            .with_status_code(200) // standard 200 containing error message for client parsing compatibility
+                            .with_header(tiny_http::Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).unwrap())
+                            .with_header(tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap());
+                        let _ = request.respond(response);
+                        continue;
+                    }
+
                     let res = execute_print_job(
-                        &payload.printerName,
+                        &printer_to_use,
                         &payload.fileContentBase64,
                         &file_ext,
                         &print_handler,
@@ -180,7 +441,7 @@ fn start_native_http_server(app: AppHandle) {
                     let log_entry = PrintLog {
                         timestamp: get_current_time_str(),
                         document_type: if file_ext == ".bin" { "POS Slip".to_string() } else { "Office Template".to_string() },
-                        printer_name: payload.printerName.clone(),
+                        printer_name: printer_to_use.clone(),
                         print_engine: if file_ext == ".bin" { "Thermal ESC/POS".to_string() } else if print_handler == "wordpad" { "Windows WordPad".to_string() } else { "Microsoft Word".to_string() },
                         status: status_str,
                         details: details_str,
@@ -222,15 +483,17 @@ fn start_native_http_server(app: AppHandle) {
     }
 }
 
-// Discovers local printers using lightweight PowerShell cmd
+// Discovers local printers using lightweight PowerShell cmd (Silent running)
 fn get_installed_printers() -> Vec<String> {
-    let output = Command::new("powershell")
-        .args(&[
-            "-NoProfile",
-            "-Command",
-            "Get-CimInstance Win32_Printer | Select-Object -ExpandProperty Name"
-        ])
-        .output();
+    let mut cmd = Command::new("powershell");
+    cmd.args(&[
+        "-NoProfile",
+        "-Command",
+        "Get-CimInstance Win32_Printer | Select-Object -ExpandProperty Name"
+    ]);
+    configure_silent_command(&mut cmd);
+    
+    let output = cmd.output();
 
     match output {
         Ok(out) => {
@@ -381,16 +644,18 @@ public class RawPrinterHelper {{
     fs::write(&temp_script_file, ps_script_content)
         .map_err(|err| format!("Failed to create temporary powershell script: {}", err))?;
 
-    // 6. Execute powershell script
-    let output = Command::new("powershell")
-        .args(&[
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            &temp_script_file.to_string_lossy()
-        ])
-        .output()
+    // 6. Execute powershell script (Silently)
+    let mut cmd = Command::new("powershell");
+    cmd.args(&[
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        &temp_script_file.to_string_lossy()
+    ]);
+    configure_silent_command(&mut cmd);
+
+    let output = cmd.output()
         .map_err(|err| format!("Failed to launch powershell execution: {}", err))?;
 
     // 7. Cleanup temp files asynchronously
@@ -407,10 +672,17 @@ public class RawPrinterHelper {{
     }
 }
 
-// Native command line helper to fetch local time on Windows systems
+// Native command line helper to fetch local time on Windows systems (Silently)
 fn get_current_time_str() -> String {
-    let date_output = Command::new("cmd").args(&["/c", "date /t"]).output();
-    let time_output = Command::new("cmd").args(&["/c", "time /t"]).output();
+    let mut cmd_date = Command::new("cmd");
+    cmd_date.args(&["/c", "date /t"]);
+    configure_silent_command(&mut cmd_date);
+    let date_output = cmd_date.output();
+
+    let mut cmd_time = Command::new("cmd");
+    cmd_time.args(&["/c", "time /t"]);
+    configure_silent_command(&mut cmd_time);
+    let time_output = cmd_time.output();
     
     let date_str = match date_output {
         Ok(out) => String::from_utf8_lossy(&out.stdout).trim().to_string(),
