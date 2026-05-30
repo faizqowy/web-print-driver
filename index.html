@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>QPOS Desktop Print Driver</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+    <script type="module" src="/src/main.ts" defer></script>
+  </head>
+
+  <body>
+    <main class="dashboard">
+      <!-- Header Section -->
+      <header class="header">
+        <div class="logo-area">
+          <div class="pulse-container">
+            <span class="pulse-dot"></span>
+          </div>
+          <div>
+            <h1>QPOS Desktop Driver</h1>
+            <p class="subtitle font-mono">Local Spool Station Active</p>
+          </div>
+        </div>
+
+        <div class="status-badge">
+          <span class="status-lbl">Port 9000</span>
+          <span class="status-val">RUNNING</span>
+        </div>
+      </header>
+
+      <!-- Grid Content -->
+      <section class="grid-layout">
+        <!-- Discovered Printers List -->
+        <div class="card card-printers">
+          <div class="card-header">
+            <h3>Discovered Printers</h3>
+            <button id="btn-refresh-printers" class="btn-icon" title="Refresh Printers">
+              <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" class="w-4 h-4">
+                <path stroke-linecap="round" strokeLinejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 1121.21 8H18.2" />
+              </svg>
+            </button>
+          </div>
+          <div class="printers-list" id="printers-container">
+            <div class="loading-state">Querying system printers...</div>
+          </div>
+        </div>
+
+        <!-- System Controls -->
+        <div class="card card-controls">
+          <div class="card-header">
+            <h3>Diagnostics & Control</h3>
+          </div>
+          <div class="controls-actions">
+            <div class="info-row">
+              <span>Local Service:</span>
+              <span class="text-emerald-400 font-bold font-mono">http://localhost:9000</span>
+            </div>
+            <div class="info-row">
+              <span>Active Engines:</span>
+              <span class="text-violet-400 font-bold">Thermal, Word, WordPad</span>
+            </div>
+            
+            <div class="btn-group">
+              <button id="btn-clear-logs" class="btn btn-secondary">
+                Clear Print History
+              </button>
+              <button id="btn-test-print" class="btn btn-primary">
+                Trigger Test Slip
+              </button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Logging History Card -->
+      <section class="card card-logs flex-1">
+        <div class="card-header border-b border-slate-800/80 pb-3">
+          <h3>Real-time Print History Logs</h3>
+          <span class="log-count" id="log-count">0 Jobs Spooled</span>
+        </div>
+        
+        <div class="logs-container">
+          <table class="logs-table">
+            <thead>
+              <tr>
+                <th class="col-time">Timestamp</th>
+                <th class="col-type">Type</th>
+                <th class="col-printer">Target Device</th>
+                <th class="col-engine">Engine</th>
+                <th class="col-status">Status</th>
+                <th class="col-details">Details</th>
+              </tr>
+            </thead>
+            <tbody id="logs-tbody">
+              <tr>
+                <td colspan="6" class="no-logs">No documents spooled yet. Open your POS cloud app and trigger print.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>
